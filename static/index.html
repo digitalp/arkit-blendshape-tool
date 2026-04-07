@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ARKit Blendshape Tool</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 340px 1fr 300px;
+      grid-template-rows: 56px 1fr;
+      height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      grid-column: 1 / -1;
+      background: #16213e;
+      display: flex;
+      align-items: center;
+      padding: 0 20px;
+      border-bottom: 1px solid #0f3460;
+      gap: 16px;
+    }
+
+    .header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #e94560;
+    }
+
+    .header .subtitle {
+      font-size: 13px;
+      color: #888;
+    }
+
+    /* Left Panel */
+    .panel-left {
+      background: #16213e;
+      border-right: 1px solid #0f3460;
+      overflow-y: auto;
+      padding: 16px;
+    }
+
+    /* Viewport */
+    .viewport {
+      position: relative;
+      background: #0a0a1a;
+      overflow: hidden;
+    }
+
+    #canvas3d {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .viewport-overlay {
+      position: absolute;
+      bottom: 12px;
+      left: 12px;
+      font-size: 11px;
+      color: #666;
+      pointer-events: none;
+    }
+
+    /* Right Panel */
+    .panel-right {
+      background: #16213e;
+      border-left: 1px solid #0f3460;
+      overflow-y: auto;
+      padding: 16px;
+    }
+
+    /* Shared panel styles */
+    .section-title {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #e94560;
+      margin-bottom: 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #0f3460;
+    }
+
+    /* Upload zones */
+    .upload-zone {
+      border: 2px dashed #0f3460;
+      border-radius: 8px;
+      padding: 20px 16px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-bottom: 12px;
+    }
+
+    .upload-zone:hover, .upload-zone.dragover {
+      border-color: #e94560;
+      background: rgba(233, 69, 96, 0.05);
+    }
+
+    .upload-zone.loaded {
+      border-color: #4ecca3;
+      background: rgba(78, 204, 163, 0.05);
+    }
+
+    .upload-zone .icon {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+
+    .upload-zone .label {
+      font-size: 13px;
+      font-weight: 500;
+      margin-bottom: 4px;
+    }
+
+    .upload-zone .hint {
+      font-size: 11px;
+      color: #666;
+    }
+
+    .upload-zone .filename {
+      font-size: 12px;
+      color: #4ecca3;
+      margin-top: 6px;
+      word-break: break-all;
+    }
+
+    /* Mesh info */
+    .mesh-info {
+      background: #0f3460;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .mesh-info .tag {
+      display: inline-block;
+      background: #e94560;
+      color: white;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      margin-right: 4px;
+    }
+
+    .mesh-info .tag.green { background: #4ecca3; color: #1a1a2e; }
+
+    /* Settings */
+    .setting-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+
+    .setting-row label {
+      font-size: 12px;
+      color: #aaa;
+    }
+
+    .setting-row input[type="number"] {
+      width: 70px;
+      background: #0a0a1a;
+      border: 1px solid #0f3460;
+      color: #e0e0e0;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+
+    /* Buttons */
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 10px 16px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      margin-bottom: 8px;
+    }
+
+    .btn-primary {
+      background: #e94560;
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: #d63851;
+    }
+
+    .btn-primary:disabled {
+      background: #444;
+      cursor: not-allowed;
+      color: #888;
+    }
+
+    .btn-secondary {
+      background: #0f3460;
+      color: #e0e0e0;
+    }
+
+    .btn-secondary:hover {
+      background: #1a4a7a;
+    }
+
+    /* Progress */
+    .progress-bar {
+      height: 4px;
+      background: #0f3460;
+      border-radius: 2px;
+      margin: 12px 0;
+      overflow: hidden;
+      display: none;
+    }
+
+    .progress-bar.active { display: block; }
+
+    .progress-bar .fill {
+      height: 100%;
+      background: #e94560;
+      border-radius: 2px;
+      transition: width 0.3s;
+      animation: progress-pulse 1.5s ease-in-out infinite;
+    }
+
+    @keyframes progress-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.6; }
+    }
+
+    /* Status */
+    .status {
+      font-size: 12px;
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      display: none;
+    }
+
+    .status.visible { display: block; }
+    .status.info { background: rgba(78, 204, 163, 0.1); color: #4ecca3; }
+    .status.error { background: rgba(233, 69, 96, 0.1); color: #e94560; }
+    .status.warning { background: rgba(255, 193, 7, 0.1); color: #ffc107; }
+
+    /* Blendshape sliders */
+    .slider-group {
+      margin-bottom: 16px;
+    }
+
+    .slider-group-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #e94560;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+
+    .slider-row {
+      display: flex;
+      align-items: center;
+      margin-bottom: 4px;
+      gap: 8px;
+    }
+
+    .slider-row label {
+      font-size: 11px;
+      color: #aaa;
+      width: 130px;
+      flex-shrink: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .slider-row input[type="range"] {
+      flex: 1;
+      height: 3px;
+      -webkit-appearance: none;
+      appearance: none;
+      background: #0f3460;
+      border-radius: 2px;
+      outline: none;
+    }
+
+    .slider-row input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #e94560;
+      cursor: pointer;
+    }
+
+    .slider-row .val {
+      font-size: 10px;
+      color: #666;
+      width: 30px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+
+    .no-targets {
+      font-size: 12px;
+      color: #666;
+      text-align: center;
+      padding: 20px;
+    }
+
+    /* Tabs */
+    .tabs {
+      display: flex;
+      gap: 2px;
+      margin-bottom: 12px;
+    }
+
+    .tab {
+      flex: 1;
+      padding: 6px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      text-align: center;
+      background: #0a0a1a;
+      border: 1px solid #0f3460;
+      border-radius: 4px;
+      cursor: pointer;
+      color: #888;
+      transition: all 0.2s;
+    }
+
+    .tab.active {
+      background: #0f3460;
+      color: #e0e0e0;
+      border-color: #e94560;
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #1a4a7a; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <!-- Header -->
+    <div class="header">
+      <h1>ARKit Blendshape Tool</h1>
+      <span class="subtitle">52 ARKit + 15 Oculus Visemes &middot; Transfer &amp; Preview</span>
+    </div>
+
+    <!-- Left Panel: Upload & Transfer -->
+    <div class="panel-left">
+      <div class="section-title">Reference GLB (with blendshapes)</div>
+      <div class="upload-zone" id="refUpload">
+        <div class="icon">📦</div>
+        <div class="label">Drop reference GLB here</div>
+        <div class="hint">Avaturn T2 or any GLB with ARKit blendshapes</div>
+        <div class="filename" id="refFilename"></div>
+      </div>
+      <div class="mesh-info" id="refInfo" style="display:none"></div>
+
+      <div class="section-title">Target GLB (no blendshapes)</div>
+      <div class="upload-zone" id="targetUpload">
+        <div class="icon">🎭</div>
+        <div class="label">Drop target GLB here</div>
+        <div class="hint">Avaturn T1 or any GLB without blendshapes</div>
+        <div class="filename" id="targetFilename"></div>
+      </div>
+      <div class="mesh-info" id="targetInfo" style="display:none"></div>
+
+      <div class="section-title">Settings</div>
+      <div class="setting-row">
+        <label>Max distance</label>
+        <input type="number" id="maxDistance" value="0.15" step="0.01" min="0.01" max="1.0">
+      </div>
+      <div class="setting-row">
+        <label>Falloff distance</label>
+        <input type="number" id="falloffDistance" value="0.08" step="0.01" min="0.01" max="0.5">
+      </div>
+
+      <div class="progress-bar" id="progressBar">
+        <div class="fill" style="width: 100%"></div>
+      </div>
+
+      <div class="status" id="status"></div>
+
+      <button class="btn btn-primary" id="transferBtn" disabled>
+        Transfer Blendshapes
+      </button>
+      <button class="btn btn-secondary" id="downloadBtn" style="display:none">
+        Download Result GLB
+      </button>
+    </div>
+
+    <!-- 3D Viewport -->
+    <div class="viewport">
+      <canvas id="canvas3d"></canvas>
+      <div class="viewport-overlay" id="viewportInfo">
+        Drop a GLB to preview &middot; Scroll to zoom &middot; Drag to orbit
+      </div>
+    </div>
+
+    <!-- Right Panel: Blendshape Sliders -->
+    <div class="panel-right">
+      <div class="section-title">Blendshape Preview</div>
+      <div class="tabs">
+        <div class="tab active" data-tab="arkit">ARKit (52)</div>
+        <div class="tab" data-tab="viseme">Visemes (15)</div>
+        <div class="tab" data-tab="all">All</div>
+      </div>
+      <div id="sliderContainer">
+        <div class="no-targets">Load a GLB with morph targets to see sliders</div>
+      </div>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
