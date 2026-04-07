@@ -6,7 +6,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 let scene, camera, renderer, controls;
 let currentModel = null;
 let morphMeshes = [];
-let refFile = null;
+let refFile = null;   // null = use built-in reference
 let targetFile = null;
 let resultBlob = null;
 let activeTab = 'arkit';
@@ -56,23 +56,18 @@ function initScene() {
   controls.dampingFactor = 0.08;
   controls.update();
 
-  // Lighting
   const ambient = new THREE.AmbientLight(0xffffff, 0.5);
   scene.add(ambient);
-
   const key = new THREE.DirectionalLight(0xffffff, 1.2);
   key.position.set(2, 3, 2);
   scene.add(key);
-
   const fill = new THREE.DirectionalLight(0x8888ff, 0.4);
   fill.position.set(-2, 1, -1);
   scene.add(fill);
-
   const rim = new THREE.DirectionalLight(0xff8888, 0.3);
   rim.position.set(0, 2, -3);
   scene.add(rim);
 
-  // Grid
   const grid = new THREE.GridHelper(4, 20, 0x0f3460, 0x0f3460);
   grid.material.opacity = 0.3;
   grid.material.transparent = true;
@@ -108,14 +103,12 @@ function loadGLB(arrayBuffer, filename) {
     currentModel = gltf.scene;
     scene.add(currentModel);
 
-    // Find meshes with morph targets
     currentModel.traverse((child) => {
       if (child.isMesh && child.morphTargetInfluences && child.morphTargetInfluences.length > 0) {
         morphMeshes.push(child);
       }
     });
 
-    // Auto-frame
     const box = new THREE.Box3().setFromObject(currentModel);
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
@@ -125,7 +118,6 @@ function loadGLB(arrayBuffer, filename) {
     camera.position.set(center.x, center.y + size.y * 0.3, center.z + maxDim * 1.8);
     controls.update();
 
-    // Update viewport info
     const totalMorphs = morphMeshes.reduce((s, m) => s + m.morphTargetInfluences.length, 0);
     document.getElementById('viewportInfo').textContent =
       `${filename} · ${totalMorphs} morph targets`;
@@ -145,7 +137,6 @@ function buildSliders() {
     return;
   }
 
-  // Collect all unique target names
   const allNames = [];
   const nameToMeshIndex = {};
 
@@ -181,7 +172,6 @@ function renderSliders(allNames, nameToMeshIndex) {
     return;
   }
 
-  // Group by category
   const groups = {};
   for (const name of filtered) {
     let group = 'Other';
@@ -193,7 +183,6 @@ function renderSliders(allNames, nameToMeshIndex) {
     else if (name.startsWith('nose')) group = 'Nose';
     else if (name.startsWith('tongue')) group = 'Tongue';
     else if (name.startsWith('viseme')) group = 'Visemes';
-
     if (!groups[group]) groups[group] = [];
     groups[group].push(name);
   }
@@ -229,7 +218,6 @@ function renderSliders(allNames, nameToMeshIndex) {
       slider.addEventListener('input', () => {
         const v = parseFloat(slider.value);
         val.textContent = v.toFixed(2);
-        // Apply to all meshes that have this target
         for (const { mesh, index } of nameToMeshIndex[name]) {
           mesh.morphTargetInfluences[index] = v;
         }
@@ -255,23 +243,14 @@ function setupUploadZone(zoneId, onFile) {
   zone.appendChild(input);
 
   zone.addEventListener('click', () => input.click());
-
-  zone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    zone.classList.add('dragover');
-  });
-
-  zone.addEventListener('dragleave', () => {
-    zone.classList.remove('dragover');
-  });
-
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => { zone.classList.remove('dragover'); });
   zone.addEventListener('drop', (e) => {
     e.preventDefault();
     zone.classList.remove('dragover');
     const file = e.dataTransfer.files[0];
     if (file) onFile(file);
   });
-
   input.addEventListener('change', () => {
     if (input.files[0]) onFile(input.files[0]);
     input.value = '';
@@ -291,6 +270,11 @@ function renderMeshInfo(info, elementId) {
   el.style.display = 'block';
 
   let html = `<strong>${info.meshCount}</strong> meshes, <strong>${info.nodeCount}</strong> nodes<br>`;
+
+  if (info.skeleton && !info.skeleton.valid) {
+    html += `<span class="tag">Missing bones: ${info.skeleton.missing.join(', ')}</span><br>`;
+    html += `<span class="hint" style="color:#ffc107">Will be auto-added during transfer</span><br>`;
+  }
 
   if (info.detectedFace) {
     html += `Face mesh: <strong>${info.detectedFace.meshName}</strong><br>`;
@@ -312,7 +296,7 @@ function renderMeshInfo(info, elementId) {
 
 // ── Transfer ──
 async function doTransfer() {
-  if (!refFile || !targetFile) return;
+  if (!targetFile) return;
 
   const btn = document.getElementById('transferBtn');
   const progress = document.getElementById('progressBar');
@@ -323,12 +307,21 @@ async function doTransfer() {
   progress.classList.add('active');
   download.style.display = 'none';
   resultBlob = null;
-  showStatus('Transferring blendshapes... This may take a moment.', 'info');
+
+  const usingBuiltIn = !refFile;
+  showStatus(
+    usingBuiltIn
+      ? 'Using built-in reference (brunette.glb)... This may take a moment.'
+      : 'Transferring blendshapes... This may take a moment.',
+    'info'
+  );
 
   try {
     const form = new FormData();
-    form.append('reference', refFile);
     form.append('target', targetFile);
+    if (refFile) {
+      form.append('reference', refFile);
+    }
     form.append('max_distance', document.getElementById('maxDistance').value);
     form.append('falloff_distance', document.getElementById('falloffDistance').value);
 
@@ -341,11 +334,10 @@ async function doTransfer() {
 
     resultBlob = await resp.blob();
 
-    // Load result into viewer
     const arrayBuffer = await resultBlob.arrayBuffer();
     loadGLB(arrayBuffer, 'result_with_blendshapes.glb');
 
-    showStatus(`Transfer complete. ${morphMeshes.length ? 'Morph targets injected.' : ''}`, 'info');
+    showStatus('Transfer complete. Morph targets injected.', 'info');
     download.style.display = 'block';
   } catch (err) {
     showStatus(`Transfer failed: ${err.message}`, 'error');
@@ -375,17 +367,19 @@ function showStatus(msg, type) {
 }
 
 function updateTransferBtn() {
-  document.getElementById('transferBtn').disabled = !(refFile && targetFile);
+  // Only target is required — reference is optional (built-in fallback)
+  document.getElementById('transferBtn').disabled = !targetFile;
 }
 
 // ── Init ──
 initScene();
 
-// Upload zones
+// Reference upload (optional — overrides built-in)
 setupUploadZone('refUpload', async (file) => {
   refFile = file;
   document.getElementById('refFilename').textContent = file.name;
   document.getElementById('refUpload').classList.add('loaded');
+  document.querySelector('#refUpload .label').textContent = 'Custom reference loaded';
 
   try {
     const info = await inspectFile(file);
@@ -394,12 +388,12 @@ setupUploadZone('refUpload', async (file) => {
     showStatus(`Inspect failed: ${e.message}`, 'error');
   }
 
-  // Preview reference in viewport
   const buf = await file.arrayBuffer();
   loadGLB(buf, file.name);
   updateTransferBtn();
 });
 
+// Target upload (required)
 setupUploadZone('targetUpload', async (file) => {
   targetFile = file;
   document.getElementById('targetFilename').textContent = file.name;
@@ -412,17 +406,14 @@ setupUploadZone('targetUpload', async (file) => {
     showStatus(`Inspect failed: ${e.message}`, 'error');
   }
 
-  // Preview target in viewport
   const buf = await file.arrayBuffer();
   loadGLB(buf, file.name);
   updateTransferBtn();
 });
 
-// Transfer button
 document.getElementById('transferBtn').addEventListener('click', doTransfer);
 document.getElementById('downloadBtn').addEventListener('click', downloadResult);
 
-// Tabs
 document.querySelectorAll('.tab').forEach(tab => {
   tab.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -432,7 +423,6 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// Also allow dropping GLB directly on viewport for quick preview
 const viewport = document.querySelector('.viewport');
 viewport.addEventListener('dragover', (e) => e.preventDefault());
 viewport.addEventListener('drop', async (e) => {
