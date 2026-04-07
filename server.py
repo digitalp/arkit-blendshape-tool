@@ -9,22 +9,28 @@ import os
 import tempfile
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
-from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from blendshape_names import ARKIT_BLENDSHAPES, OCULUS_VISEMES, ALL_BLENDSHAPES
+from blendshape_names import (
+    ARKIT_BLENDSHAPES, OCULUS_VISEMES, TALKINGHEAD_EXTRAS, ALL_BLENDSHAPES,
+)
 from glb_utils import (
     load_glb,
     save_glb,
     find_face_mesh,
+    find_all_face_meshes,
     get_accessor_data,
     get_existing_morph_target_names,
     get_morph_target_data,
+    validate_skeleton,
 )
 from transfer import transfer_all_blendshapes
 from inject import inject_morph_targets
+from extras import synthesize_extras
 
 app = FastAPI(title="ARKit Blendshape Tool")
 
@@ -54,6 +60,10 @@ async def inspect_glb(file: UploadFile = File(...)):
         tmp.close()
 
         gltf = load_glb(tmp.name)
+
+        # Validate skeleton
+        skel = validate_skeleton(gltf)
+
         meshes = []
         for mi, mesh in enumerate(gltf.meshes):
             names = get_existing_morph_target_names(gltf, mi)
@@ -94,11 +104,19 @@ async def inspect_glb(file: UploadFile = File(...)):
                 "meshName": gltf.meshes[mi].name or "(unnamed)",
             }
 
+        all_face = find_all_face_meshes(gltf)
+
         return {
             "meshCount": len(gltf.meshes),
             "nodeCount": len(gltf.nodes),
             "meshes": meshes,
             "detectedFace": detected_face,
+            "allFaceMeshes": [
+                {"meshIndex": mi, "primIndex": pi,
+                 "meshName": gltf.meshes[mi].name}
+                for mi, pi in all_face
+            ],
+            "skeleton": skel,
         }
     finally:
         os.unlink(tmp.name)
@@ -130,9 +148,8 @@ async def transfer_blendshapes(
         ref_gltf = load_glb(ref_tmp.name)
         target_gltf = load_glb(tgt_tmp.name)
 
+        # Find reference face mesh (the one with morph targets)
         ref_mesh_name = face_mesh_ref if face_mesh_ref else None
-        tgt_mesh_name = face_mesh_target if face_mesh_target else None
-
         ref_face = find_face_mesh(ref_gltf, ref_mesh_name)
         if ref_face is None:
             names = [m.name for m in ref_gltf.meshes]
@@ -141,17 +158,7 @@ async def transfer_blendshapes(
                 f"Could not find face mesh in reference. Available: {names}"
             )
 
-        target_face = find_face_mesh(target_gltf, tgt_mesh_name)
-        if target_face is None:
-            names = [m.name for m in target_gltf.meshes]
-            raise HTTPException(
-                400,
-                f"Could not find face mesh in target. Available: {names}"
-            )
-
         ref_mi, ref_pi = ref_face
-        target_mi, target_pi = target_face
-
         ref_prim = ref_gltf.meshes[ref_mi].primitives[ref_pi]
         ref_positions = get_accessor_data(ref_gltf, ref_prim.attributes.POSITION)
         ref_blendshapes = get_morph_target_data(ref_gltf, ref_mi, ref_pi)
@@ -161,44 +168,56 @@ async def transfer_blendshapes(
                 400, "Reference GLB has no morph targets on the face mesh."
             )
 
-        target_prim = target_gltf.meshes[target_mi].primitives[target_pi]
-        target_positions = get_accessor_data(
-            target_gltf, target_prim.attributes.POSITION
-        )
+        # Find ALL face-related meshes in target (head, eyes, teeth)
+        target_face_meshes = find_all_face_meshes(target_gltf)
+        if not target_face_meshes:
+            # Fallback to single detected face mesh
+            tgt_mesh_name = face_mesh_target if face_mesh_target else None
+            target_face = find_face_mesh(target_gltf, tgt_mesh_name)
+            if target_face is None:
+                names = [m.name for m in target_gltf.meshes]
+                raise HTTPException(
+                    400,
+                    f"Could not find face mesh in target. Available: {names}"
+                )
+            target_face_meshes = [target_face]
 
-        transferred = transfer_all_blendshapes(
-            ref_positions,
-            target_positions,
-            ref_blendshapes,
-            max_distance=max_distance,
-            falloff_distance=falloff_distance,
-        )
+        # Build the canonical blendshape order
+        order = _build_blendshape_order(ref_blendshapes)
 
-        # Order: ARKit, then visemes, then others
-        order = []
-        for name in ARKIT_BLENDSHAPES:
-            if name in transferred:
-                order.append(name)
-        for name in OCULUS_VISEMES:
-            if name in transferred:
-                order.append(name)
-        for name in transferred:
-            if name not in order:
-                order.append(name)
+        # Transfer and inject onto each face-related mesh
+        for tgt_mi, tgt_pi in target_face_meshes:
+            tgt_prim = target_gltf.meshes[tgt_mi].primitives[tgt_pi]
+            tgt_positions = get_accessor_data(
+                target_gltf, tgt_prim.attributes.POSITION
+            )
 
-        target_gltf = inject_morph_targets(
-            target_gltf, target_mi, target_pi, transferred, order
-        )
+            transferred = transfer_all_blendshapes(
+                ref_positions, tgt_positions, ref_blendshapes,
+                max_distance=max_distance,
+                falloff_distance=falloff_distance,
+            )
+
+            # Synthesize the 5 extra TalkingHead blendshapes
+            extras = synthesize_extras(transferred)
+            transferred.update(extras)
+
+            mesh_name = target_gltf.meshes[tgt_mi].name or "(unnamed)"
+            print(f"  Injecting {len(order)} targets into '{mesh_name}'")
+
+            target_gltf = inject_morph_targets(
+                target_gltf, tgt_mi, tgt_pi, transferred, order
+            )
 
         save_glb(target_gltf, out_tmp.name)
-
         out_bytes = open(out_tmp.name, "rb").read()
 
         return StreamingResponse(
             io.BytesIO(out_bytes),
             media_type="model/gltf-binary",
             headers={
-                "Content-Disposition": "attachment; filename=output_with_blendshapes.glb"
+                "Content-Disposition":
+                    "attachment; filename=output_with_blendshapes.glb"
             },
         )
     finally:
@@ -207,6 +226,31 @@ async def transfer_blendshapes(
                 os.unlink(f)
             except OSError:
                 pass
+
+
+def _build_blendshape_order(ref_blendshapes: dict) -> list:
+    """Build canonical order: mouthOpen first, then visemes, ARKit, extras."""
+    order = []
+    # TalkingHead reference order: mouthOpen first, then visemes,
+    # then mouthSmile, then ARKit, then remaining extras
+    if "mouthOpen" in ref_blendshapes:
+        order.append("mouthOpen")
+    for name in OCULUS_VISEMES:
+        if name not in order:
+            order.append(name)
+    if "mouthSmile" not in order:
+        order.append("mouthSmile")
+    for name in ARKIT_BLENDSHAPES:
+        if name not in order:
+            order.append(name)
+    for name in TALKINGHEAD_EXTRAS:
+        if name not in order:
+            order.append(name)
+    # Any remaining from reference
+    for name in ref_blendshapes:
+        if name not in order:
+            order.append(name)
+    return order
 
 
 if __name__ == "__main__":

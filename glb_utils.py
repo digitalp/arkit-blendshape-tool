@@ -2,10 +2,8 @@
 Utilities for reading/writing GLB morph targets using pygltflib.
 """
 
-import struct
 import numpy as np
 from pygltflib import GLTF2, Accessor, BufferView
-from pygltflib.validator import summary as gltf_summary
 
 
 # glTF component type constants
@@ -29,9 +27,7 @@ def get_accessor_data(gltf: GLTF2, accessor_index: int) -> np.ndarray:
     accessor = gltf.accessors[accessor_index]
     buffer_view = gltf.bufferViews[accessor.bufferView]
 
-    # Get the binary blob
     blob = gltf.binary_blob()
-
     byte_offset = (buffer_view.byteOffset or 0) + (accessor.byteOffset or 0)
 
     if accessor.type == "VEC3":
@@ -58,12 +54,10 @@ def get_accessor_data(gltf: GLTF2, accessor_index: int) -> np.ndarray:
     count = accessor.count
 
     if stride == components * comp_size:
-        # Tightly packed — fast path
         length = count * components * comp_size
         raw = blob[byte_offset : byte_offset + length]
         data = np.frombuffer(raw, dtype=dtype).reshape(count, components)
     else:
-        # Strided access
         data = np.zeros((count, components), dtype=dtype)
         for i in range(count):
             offset = byte_offset + i * stride
@@ -75,20 +69,14 @@ def get_accessor_data(gltf: GLTF2, accessor_index: int) -> np.ndarray:
 
 def find_face_mesh(gltf: GLTF2, mesh_name: str = None):
     """
-    Find the face/head mesh primitive in the GLB.
+    Find the primary face/head mesh primitive in the GLB.
     Returns (mesh_index, primitive_index) or None.
-
-    If mesh_name is provided, searches for an exact (case-insensitive) match.
-    Otherwise uses heuristics: looks for meshes with names containing
-    'head', 'face', or 'Wolf3D_Head', falling back to the mesh with
-    the most vertices.
     """
     if mesh_name:
         target = mesh_name.lower()
         for mi, mesh in enumerate(gltf.meshes):
             if (mesh.name or "").lower() == target:
                 return (mi, 0)
-        # Partial match fallback
         for mi, mesh in enumerate(gltf.meshes):
             if target in (mesh.name or "").lower():
                 return (mi, 0)
@@ -107,7 +95,6 @@ def find_face_mesh(gltf: GLTF2, mesh_name: str = None):
             acc = gltf.accessors[prim.attributes.POSITION]
             vcount = acc.count
 
-            # Prefer meshes with face-related names
             if any(kw in name for kw in ["head", "face", "wolf3d_head"]):
                 if face_candidate is None or vcount > face_vcount:
                     face_candidate = (mi, pi)
@@ -120,11 +107,59 @@ def find_face_mesh(gltf: GLTF2, mesh_name: str = None):
     return face_candidate or best
 
 
+def find_all_face_meshes(gltf: GLTF2) -> list:
+    """
+    Find ALL face-related mesh primitives in the GLB.
+    TalkingHead expects morph targets on head, eyes, and teeth meshes.
+
+    Returns list of (mesh_index, primitive_index) tuples.
+    """
+    from blendshape_names import FACE_MESH_KEYWORDS
+
+    results = []
+    for mi, mesh in enumerate(gltf.meshes):
+        name = (mesh.name or "").lower()
+        if any(kw in name for kw in FACE_MESH_KEYWORDS):
+            for pi in range(len(mesh.primitives)):
+                results.append((mi, pi))
+
+    return results
+
+
+def get_bone_names(gltf: GLTF2) -> list:
+    """Get all bone/node names from the GLB."""
+    return [node.name for node in gltf.nodes if node.name]
+
+
+def validate_skeleton(gltf: GLTF2) -> dict:
+    """
+    Check if the GLB has the bones TalkingHead requires.
+    Returns dict with 'valid', 'present', 'missing' keys.
+    """
+    from blendshape_names import REQUIRED_BONES
+
+    bone_names = set(get_bone_names(gltf))
+    # Also check without 'mixamorig' prefix (TalkingHead strips it)
+    stripped = set()
+    for name in bone_names:
+        if name.startswith("mixamorig"):
+            stripped.add(name.replace("mixamorig", ""))
+        stripped.add(name)
+
+    present = [b for b in REQUIRED_BONES if b in stripped]
+    missing = [b for b in REQUIRED_BONES if b not in stripped]
+
+    return {
+        "valid": len(missing) == 0,
+        "present": present,
+        "missing": missing,
+    }
+
+
 def get_existing_morph_target_names(gltf: GLTF2, mesh_index: int) -> list:
     """Get the list of morph target names from mesh extras or targetNames."""
     mesh = gltf.meshes[mesh_index]
 
-    # Check mesh.extras.targetNames (common convention)
     if mesh.extras and isinstance(mesh.extras, dict):
         names = mesh.extras.get("targetNames", [])
         if names:
@@ -146,8 +181,6 @@ def get_morph_target_data(gltf: GLTF2, mesh_index: int, prim_index: int):
     if prim.targets:
         for i, target in enumerate(prim.targets):
             name = names[i] if i < len(names) else f"target_{i}"
-            # Morph targets can be dicts or Attributes objects depending
-            # on pygltflib version and how the GLB was loaded
             if isinstance(target, dict):
                 pos_idx = target.get("POSITION")
             else:

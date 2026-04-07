@@ -5,16 +5,15 @@ This module handles the low-level glTF binary manipulation needed to
 add new morph targets to an existing mesh primitive.
 """
 
-import struct
 import numpy as np
 from pygltflib import (
     GLTF2,
     Accessor,
+    Attributes,
     BufferView,
 )
 
 FLOAT = 5126
-ARRAY_BUFFER = 34962
 
 
 def _pack_vec3_array(data: np.ndarray) -> bytes:
@@ -29,6 +28,11 @@ def _compute_bounds(data: np.ndarray):
     return mins, maxs
 
 
+def _align_to_4(offset: int) -> int:
+    """Round up to next 4-byte boundary (glTF spec requirement)."""
+    return (offset + 3) & ~3
+
+
 def inject_morph_targets(
     gltf: GLTF2,
     mesh_index: int,
@@ -39,16 +43,8 @@ def inject_morph_targets(
     """
     Inject morph target displacements into a GLB mesh primitive.
 
-    Args:
-        gltf: The GLTF2 object to modify
-        mesh_index: Index of the mesh to modify
-        prim_index: Index of the primitive within the mesh
-        blendshapes: dict of {name: (V, 3) displacement array}
-        blendshape_order: ordered list of blendshape names to use.
-            If None, uses dict key order.
-
-    Returns:
-        Modified GLTF2 object
+    Preserves all existing binary data and appends new morph target
+    data with proper 4-byte alignment per the glTF spec.
     """
     if blendshape_order is None:
         blendshape_order = list(blendshapes.keys())
@@ -61,8 +57,11 @@ def inject_morph_targets(
     if blob is None:
         blob = b""
 
-    # We'll append all new morph target data to the existing blob
-    new_data = bytearray()
+    # Pad existing blob to 4-byte alignment before appending
+    aligned_start = _align_to_4(len(blob))
+    padding = aligned_start - len(blob)
+
+    new_data = bytearray(b'\x00' * padding)
     new_targets = []
     target_names = []
 
@@ -74,13 +73,22 @@ def inject_morph_targets(
         raw = _pack_vec3_array(disp)
         mins, maxs = _compute_bounds(disp)
 
+        # Current offset into the combined buffer
+        current_offset = len(blob) + len(new_data)
+
+        # Ensure 4-byte alignment for this buffer view
+        aligned_offset = _align_to_4(current_offset)
+        if aligned_offset > current_offset:
+            new_data.extend(b'\x00' * (aligned_offset - current_offset))
+
+        bv_offset = len(blob) + len(new_data)
+
         # Create buffer view
         bv_index = len(gltf.bufferViews)
         bv = BufferView(
             buffer=0,
-            byteOffset=len(blob) + len(new_data),
+            byteOffset=bv_offset,
             byteLength=len(raw),
-            target=None,  # morph targets don't need a target
         )
         gltf.bufferViews.append(bv)
 
@@ -97,21 +105,20 @@ def inject_morph_targets(
         )
         gltf.accessors.append(acc)
 
-        # Build the target as a plain dict (pygltflib morph targets are dicts)
-        target = {"POSITION": acc_index}
+        # pygltflib expects Attributes objects for morph targets
+        target = Attributes(POSITION=acc_index)
         new_targets.append(target)
         target_names.append(name)
 
         new_data.extend(raw)
 
     # Set the targets on the primitive
-    # If there were existing targets, we replace them entirely
     prim.targets = new_targets
 
     # Set default weights (all zero)
     mesh.weights = [0.0] * len(new_targets)
 
-    # Store target names in mesh extras
+    # Store target names in mesh extras (standard glTF convention)
     if mesh.extras is None:
         mesh.extras = {}
     mesh.extras["targetNames"] = target_names
@@ -119,8 +126,6 @@ def inject_morph_targets(
     # Update the buffer size and binary blob
     combined = bytearray(blob) + new_data
     gltf.buffers[0].byteLength = len(combined)
-
-    # Set the binary blob
     gltf.set_binary_blob(bytes(combined))
 
     return gltf

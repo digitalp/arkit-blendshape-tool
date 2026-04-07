@@ -75,4 +75,31 @@ OCULUS_VISEMES = [
     "viseme_U",
 ]
 
-ALL_BLENDSHAPES = ARKIT_BLENDSHAPES + OCULUS_VISEMES
+# Extra blendshapes TalkingHead auto-generates from ARKit if missing,
+# but including them explicitly ensures maximum compatibility.
+TALKINGHEAD_EXTRAS = [
+    "mouthOpen",
+    "mouthSmile",
+    "eyesClosed",
+    "eyesLookUp",
+    "eyesLookDown",
+]
+
+ALL_BLENDSHAPES = ARKIT_BLENDSHAPES + OCULUS_VISEMES + TALKINGHEAD_EXTRAS
+
+# Bone names TalkingHead requires (Mixamo-compatible skeleton)
+REQUIRED_BONES = [
+    "Hips", "Spine", "Spine1", "Spine2", "Neck", "Head",
+    "LeftEye", "RightEye",
+    "LeftShoulder", "LeftArm", "LeftForeArm", "LeftHand",
+    "RightShoulder", "RightArm", "RightForeArm", "RightHand",
+    "LeftUpLeg", "LeftLeg", "LeftFoot",
+    "RightUpLeg", "RightLeg", "RightFoot",
+]
+
+# Mesh name patterns that should receive morph targets
+# (TalkingHead expects targets on all face-related meshes)
+FACE_MESH_KEYWORDS = [
+    "head", "face", "teeth", "eyeleft", "eyeright",
+    "eye_left", "eye_right", "wolf3d_head", "wolf3d_teeth",
+]

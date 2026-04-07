@@ -2,9 +2,8 @@
 """
 ARKit Blendshape + Oculus Viseme Injector for GLB Avatars
 
-Transfers ARKit 52 blendshapes and 15 Oculus visemes from a reference
-GLB (e.g., Avaturn T2) onto a target GLB (e.g., Avaturn T1) that
-lacks them.
+Transfers ARKit 52 blendshapes, 15 Oculus visemes, and 5 TalkingHead
+extras from a reference GLB onto a target GLB.
 
 Usage:
     python main.py transfer --reference ref.glb --target target.glb --output output.glb
@@ -13,21 +12,25 @@ Usage:
 
 import argparse
 import sys
-import os
 
 import numpy as np
 
-from blendshape_names import ARKIT_BLENDSHAPES, OCULUS_VISEMES, ALL_BLENDSHAPES
+from blendshape_names import (
+    ARKIT_BLENDSHAPES, OCULUS_VISEMES, TALKINGHEAD_EXTRAS, ALL_BLENDSHAPES,
+)
 from glb_utils import (
     load_glb,
     save_glb,
     find_face_mesh,
+    find_all_face_meshes,
     get_accessor_data,
     get_existing_morph_target_names,
     get_morph_target_data,
+    validate_skeleton,
 )
 from transfer import transfer_all_blendshapes
 from inject import inject_morph_targets
+from extras import synthesize_extras
 
 
 def cmd_inspect(args):
@@ -37,8 +40,24 @@ def cmd_inspect(args):
     print(f"\nFile: {args.input}")
     print(f"Meshes: {len(gltf.meshes)}")
     print(f"Nodes: {len(gltf.nodes)}")
-    print()
 
+    # Skeleton validation
+    skel = validate_skeleton(gltf)
+    if skel["valid"]:
+        print(f"Skeleton: OK ({len(skel['present'])} required bones found)")
+    else:
+        print(f"Skeleton: INCOMPLETE — missing {len(skel['missing'])} bones:")
+        for b in skel["missing"]:
+            print(f"    - {b}")
+
+    # Face meshes
+    all_face = find_all_face_meshes(gltf)
+    if all_face:
+        print(f"Face meshes: {len(all_face)}")
+        for mi, pi in all_face:
+            print(f"    {gltf.meshes[mi].name}")
+
+    print()
     for mi, mesh in enumerate(gltf.meshes):
         print(f"  Mesh {mi}: '{mesh.name or '(unnamed)'}'")
         names = get_existing_morph_target_names(gltf, mi)
@@ -53,25 +72,22 @@ def cmd_inspect(args):
                   f"{n_targets} morph targets")
 
             if names:
-                # Categorize
                 arkit = [n for n in names if n in ARKIT_BLENDSHAPES]
                 visemes = [n for n in names if n in OCULUS_VISEMES]
-                other = [n for n in names
-                         if n not in ARKIT_BLENDSHAPES and n not in OCULUS_VISEMES]
+                extras = [n for n in names if n in TALKINGHEAD_EXTRAS]
+                other = [n for n in names if n not in ALL_BLENDSHAPES]
 
-                print(f"      ARKit blendshapes: {len(arkit)}/52")
-                print(f"      Oculus visemes: {len(visemes)}/15")
+                print(f"      ARKit: {len(arkit)}/52, "
+                      f"Visemes: {len(visemes)}/15, "
+                      f"Extras: {len(extras)}/5")
                 if other:
-                    print(f"      Other: {len(other)} ({', '.join(other[:5])}...)")
+                    print(f"      Other: {', '.join(other)}")
 
-    # Identify face mesh
     face = find_face_mesh(gltf)
     if face:
         mi, pi = face
-        print(f"\n  Detected face mesh: Mesh {mi}, Primitive {pi} "
+        print(f"\n  Primary face mesh: Mesh {mi} "
               f"('{gltf.meshes[mi].name or '(unnamed)'}')")
-    else:
-        print("\n  Could not auto-detect face mesh.")
 
 
 def cmd_transfer(args):
@@ -82,99 +98,98 @@ def cmd_transfer(args):
     print(f"Loading target: {args.target}")
     target_gltf = load_glb(args.target)
 
-    # Find face meshes
+    # Validate target skeleton
+    skel = validate_skeleton(target_gltf)
+    if not skel["valid"]:
+        print(f"\nWARNING: Target is missing {len(skel['missing'])} bones "
+              f"required by TalkingHead:")
+        for b in skel["missing"]:
+            print(f"    - {b}")
+        print("The output may not work in TalkingHead.\n")
+
+    # Find reference face mesh
     ref_face = find_face_mesh(ref_gltf, args.face_mesh_ref)
     if ref_face is None:
         print("ERROR: Could not find face mesh in reference GLB.")
         print("Available meshes:")
         for i, m in enumerate(ref_gltf.meshes):
             print(f"  {i}: '{m.name}'")
-        print("Use --face-mesh-ref to specify the mesh name.")
-        sys.exit(1)
-
-    target_face = find_face_mesh(target_gltf, args.face_mesh_target)
-    if target_face is None:
-        print("ERROR: Could not find face mesh in target GLB.")
-        print("Available meshes:")
-        for i, m in enumerate(target_gltf.meshes):
-            print(f"  {i}: '{m.name}'")
-        print("Use --face-mesh-target to specify the mesh name.")
         sys.exit(1)
 
     ref_mi, ref_pi = ref_face
-    target_mi, target_pi = target_face
+    print(f"\nReference face: '{ref_gltf.meshes[ref_mi].name}'")
 
-    print(f"\nReference face: Mesh {ref_mi} '{ref_gltf.meshes[ref_mi].name}', "
-          f"Primitive {ref_pi}")
-    print(f"Target face: Mesh {target_mi} '{target_gltf.meshes[target_mi].name}', "
-          f"Primitive {target_pi}")
-
-    # Get reference positions and blendshapes
     ref_prim = ref_gltf.meshes[ref_mi].primitives[ref_pi]
     ref_positions = get_accessor_data(ref_gltf, ref_prim.attributes.POSITION)
-    print(f"\nReference vertices: {ref_positions.shape[0]}")
-
     ref_blendshapes = get_morph_target_data(ref_gltf, ref_mi, ref_pi)
-    print(f"Reference blendshapes: {len(ref_blendshapes)}")
 
     if not ref_blendshapes:
         print("ERROR: Reference GLB has no morph targets on the face mesh.")
         sys.exit(1)
 
-    # Report which blendshapes are available
-    available_arkit = [n for n in ref_blendshapes if n in ARKIT_BLENDSHAPES]
-    available_visemes = [n for n in ref_blendshapes if n in OCULUS_VISEMES]
-    print(f"  ARKit: {len(available_arkit)}/52")
-    print(f"  Visemes: {len(available_visemes)}/15")
+    print(f"Reference: {ref_positions.shape[0]} verts, "
+          f"{len(ref_blendshapes)} blendshapes")
 
-    missing_arkit = [n for n in ARKIT_BLENDSHAPES if n not in ref_blendshapes]
-    missing_visemes = [n for n in OCULUS_VISEMES if n not in ref_blendshapes]
-    if missing_arkit:
-        print(f"  Missing ARKit: {', '.join(missing_arkit[:10])}"
-              f"{'...' if len(missing_arkit) > 10 else ''}")
-    if missing_visemes:
-        print(f"  Missing visemes: {', '.join(missing_visemes[:10])}"
-              f"{'...' if len(missing_visemes) > 10 else ''}")
+    # Find ALL face-related meshes in target
+    target_face_meshes = find_all_face_meshes(target_gltf)
+    if not target_face_meshes:
+        target_face = find_face_mesh(target_gltf, args.face_mesh_target)
+        if target_face is None:
+            print("ERROR: Could not find face mesh in target GLB.")
+            for i, m in enumerate(target_gltf.meshes):
+                print(f"  {i}: '{m.name}'")
+            sys.exit(1)
+        target_face_meshes = [target_face]
 
-    # Get target positions
-    target_prim = target_gltf.meshes[target_mi].primitives[target_pi]
-    target_positions = get_accessor_data(target_gltf, target_prim.attributes.POSITION)
-    print(f"\nTarget vertices: {target_positions.shape[0]}")
+    print(f"Target face meshes: {len(target_face_meshes)}")
+    for mi, pi in target_face_meshes:
+        print(f"  '{target_gltf.meshes[mi].name}'")
 
-    # Transfer blendshapes
-    print("\nTransferring blendshapes...")
-    transferred = transfer_all_blendshapes(
-        ref_positions,
-        target_positions,
-        ref_blendshapes,
-        max_distance=args.max_distance,
-        falloff_distance=args.falloff_distance,
-    )
-
-    print(f"\nTransferred {len(transferred)} blendshapes")
-
-    # Determine injection order: ARKit first, then visemes, then others
+    # Build canonical blendshape order
     order = []
-    for name in ARKIT_BLENDSHAPES:
-        if name in transferred:
-            order.append(name)
+    if "mouthOpen" in ref_blendshapes:
+        order.append("mouthOpen")
     for name in OCULUS_VISEMES:
-        if name in transferred:
+        if name not in order:
             order.append(name)
-    for name in transferred:
+    if "mouthSmile" not in order:
+        order.append("mouthSmile")
+    for name in ARKIT_BLENDSHAPES:
+        if name not in order:
+            order.append(name)
+    for name in TALKINGHEAD_EXTRAS:
+        if name not in order:
+            order.append(name)
+    for name in ref_blendshapes:
         if name not in order:
             order.append(name)
 
-    # Inject into target
-    print(f"Injecting {len(order)} morph targets into target GLB...")
-    target_gltf = inject_morph_targets(
-        target_gltf, target_mi, target_pi, transferred, order
-    )
+    # Transfer and inject onto each face mesh
+    for tgt_mi, tgt_pi in target_face_meshes:
+        tgt_prim = target_gltf.meshes[tgt_mi].primitives[tgt_pi]
+        tgt_positions = get_accessor_data(
+            target_gltf, tgt_prim.attributes.POSITION
+        )
+        mesh_name = target_gltf.meshes[tgt_mi].name or "(unnamed)"
+        print(f"\nTransferring to '{mesh_name}' ({tgt_positions.shape[0]} verts)...")
 
-    # Save
-    output = args.output
-    save_glb(target_gltf, output)
-    print(f"\nSaved: {output}")
+        transferred = transfer_all_blendshapes(
+            ref_positions, tgt_positions, ref_blendshapes,
+            max_distance=args.max_distance,
+            falloff_distance=args.falloff_distance,
+        )
+
+        # Synthesize extra blendshapes
+        extras = synthesize_extras(transferred)
+        transferred.update(extras)
+
+        print(f"  Injecting {len(order)} morph targets...")
+        target_gltf = inject_morph_targets(
+            target_gltf, tgt_mi, tgt_pi, transferred, order
+        )
+
+    save_glb(target_gltf, args.output)
+    print(f"\nSaved: {args.output}")
     print("Done.")
 
 
@@ -184,24 +199,22 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
-    # inspect
     p_inspect = subparsers.add_parser(
         "inspect", help="Inspect a GLB for mesh info and morph targets"
     )
     p_inspect.add_argument("--input", "-i", required=True, help="Input GLB file")
 
-    # transfer
     p_transfer = subparsers.add_parser(
         "transfer",
         help="Transfer blendshapes from a reference GLB to a target GLB",
     )
     p_transfer.add_argument(
         "--reference", "-r", required=True,
-        help="Reference GLB with existing ARKit blendshapes (e.g., Avaturn T2)",
+        help="Reference GLB with existing ARKit blendshapes",
     )
     p_transfer.add_argument(
         "--target", "-t", required=True,
-        help="Target GLB without blendshapes (e.g., Avaturn T1)",
+        help="Target GLB without blendshapes",
     )
     p_transfer.add_argument(
         "--output", "-o", required=True,
