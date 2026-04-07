@@ -11,7 +11,6 @@ from pygltflib import (
     GLTF2,
     Accessor,
     BufferView,
-    Primitive,
 )
 
 FLOAT = 5126
@@ -98,9 +97,8 @@ def inject_morph_targets(
         )
         gltf.accessors.append(acc)
 
-        # Build the target dict — pygltflib uses attribute-style access
-        from pygltflib import Attributes
-        target = Attributes(POSITION=acc_index)
+        # Build the target as a plain dict (pygltflib morph targets are dicts)
+        target = {"POSITION": acc_index}
         new_targets.append(target)
         target_names.append(name)
 

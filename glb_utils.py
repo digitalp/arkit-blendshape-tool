@@ -146,7 +146,13 @@ def get_morph_target_data(gltf: GLTF2, mesh_index: int, prim_index: int):
     if prim.targets:
         for i, target in enumerate(prim.targets):
             name = names[i] if i < len(names) else f"target_{i}"
-            if target.POSITION is not None:
-                targets[name] = get_accessor_data(gltf, target.POSITION)
+            # Morph targets can be dicts or Attributes objects depending
+            # on pygltflib version and how the GLB was loaded
+            if isinstance(target, dict):
+                pos_idx = target.get("POSITION")
+            else:
+                pos_idx = getattr(target, "POSITION", None)
+            if pos_idx is not None:
+                targets[name] = get_accessor_data(gltf, pos_idx)
 
     return targets
