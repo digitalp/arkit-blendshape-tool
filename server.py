@@ -31,6 +31,7 @@ from glb_utils import (
 from transfer import transfer_all_blendshapes
 from inject import inject_morph_targets
 from extras import synthesize_extras
+from skeleton_fix import add_missing_bones
 
 app = FastAPI(title="ARKit Blendshape Tool")
 
@@ -41,7 +42,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-STATIC_DIR = Path(__file__).parent / "static"
+BASE_DIR = Path(__file__).parent
+STATIC_DIR = BASE_DIR / "static"
+REFERENCE_GLB = BASE_DIR / "reference" / "brunette.glb"
+
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -60,8 +64,6 @@ async def inspect_glb(file: UploadFile = File(...)):
         tmp.close()
 
         gltf = load_glb(tmp.name)
-
-        # Validate skeleton
         skel = validate_skeleton(gltf)
 
         meshes = []
@@ -117,6 +119,7 @@ async def inspect_glb(file: UploadFile = File(...)):
                 for mi, pi in all_face
             ],
             "skeleton": skel,
+            "hasBuiltinReference": REFERENCE_GLB.exists(),
         }
     finally:
         os.unlink(tmp.name)
@@ -124,31 +127,49 @@ async def inspect_glb(file: UploadFile = File(...)):
 
 @app.post("/api/transfer")
 async def transfer_blendshapes(
-    reference: UploadFile = File(...),
     target: UploadFile = File(...),
+    reference: UploadFile = File(None),
     max_distance: float = Form(0.15),
     falloff_distance: float = Form(0.08),
     face_mesh_ref: str = Form(None),
     face_mesh_target: str = Form(None),
 ):
-    """Transfer blendshapes from reference to target and return the result GLB."""
-    ref_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+    """
+    Transfer blendshapes onto target GLB.
+    If no reference is uploaded, uses the built-in brunette.glb.
+    """
     tgt_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+    ref_tmp = None
     out_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
 
     try:
-        ref_content = await reference.read()
-        ref_tmp.write(ref_content)
-        ref_tmp.close()
-
         tgt_content = await target.read()
         tgt_tmp.write(tgt_content)
         tgt_tmp.close()
 
-        ref_gltf = load_glb(ref_tmp.name)
+        # Use uploaded reference or fall back to built-in
+        if reference is not None:
+            ref_content = await reference.read()
+            if len(ref_content) > 0:
+                ref_tmp = tempfile.NamedTemporaryFile(suffix=".glb", delete=False)
+                ref_tmp.write(ref_content)
+                ref_tmp.close()
+                ref_path = ref_tmp.name
+            else:
+                ref_path = str(REFERENCE_GLB)
+        else:
+            ref_path = str(REFERENCE_GLB)
+
+        if not os.path.exists(ref_path):
+            raise HTTPException(
+                400,
+                "No reference GLB uploaded and built-in reference not found."
+            )
+
+        ref_gltf = load_glb(ref_path)
         target_gltf = load_glb(tgt_tmp.name)
 
-        # Find reference face mesh (the one with morph targets)
+        # Find reference face mesh
         ref_mesh_name = face_mesh_ref if face_mesh_ref else None
         ref_face = find_face_mesh(ref_gltf, ref_mesh_name)
         if ref_face is None:
@@ -168,10 +189,14 @@ async def transfer_blendshapes(
                 400, "Reference GLB has no morph targets on the face mesh."
             )
 
-        # Find ALL face-related meshes in target (head, eyes, teeth)
+        # Fix skeleton: add missing bones (LeftEye, RightEye, etc.)
+        target_gltf, added_bones = add_missing_bones(target_gltf)
+        if added_bones:
+            print(f"  Added missing bones: {added_bones}")
+
+        # Find face meshes in target
         target_face_meshes = find_all_face_meshes(target_gltf)
         if not target_face_meshes:
-            # Fallback to single detected face mesh
             tgt_mesh_name = face_mesh_target if face_mesh_target else None
             target_face = find_face_mesh(target_gltf, tgt_mesh_name)
             if target_face is None:
@@ -182,10 +207,10 @@ async def transfer_blendshapes(
                 )
             target_face_meshes = [target_face]
 
-        # Build the canonical blendshape order
+        # Build blendshape order
         order = _build_blendshape_order(ref_blendshapes)
 
-        # Transfer and inject onto each face-related mesh
+        # Transfer and inject onto each face mesh
         for tgt_mi, tgt_pi in target_face_meshes:
             tgt_prim = target_gltf.meshes[tgt_mi].primitives[tgt_pi]
             tgt_positions = get_accessor_data(
@@ -198,7 +223,6 @@ async def transfer_blendshapes(
                 falloff_distance=falloff_distance,
             )
 
-            # Synthesize the 5 extra TalkingHead blendshapes
             extras = synthesize_extras(transferred)
             transferred.update(extras)
 
@@ -221,9 +245,14 @@ async def transfer_blendshapes(
             },
         )
     finally:
-        for f in [ref_tmp.name, tgt_tmp.name, out_tmp.name]:
+        for f in [tgt_tmp.name, out_tmp.name]:
             try:
                 os.unlink(f)
+            except OSError:
+                pass
+        if ref_tmp:
+            try:
+                os.unlink(ref_tmp.name)
             except OSError:
                 pass
 
@@ -231,8 +260,6 @@ async def transfer_blendshapes(
 def _build_blendshape_order(ref_blendshapes: dict) -> list:
     """Build canonical order: mouthOpen first, then visemes, ARKit, extras."""
     order = []
-    # TalkingHead reference order: mouthOpen first, then visemes,
-    # then mouthSmile, then ARKit, then remaining extras
     if "mouthOpen" in ref_blendshapes:
         order.append("mouthOpen")
     for name in OCULUS_VISEMES:
@@ -246,7 +273,6 @@ def _build_blendshape_order(ref_blendshapes: dict) -> list:
     for name in TALKINGHEAD_EXTRAS:
         if name not in order:
             order.append(name)
-    # Any remaining from reference
     for name in ref_blendshapes:
         if name not in order:
             order.append(name)

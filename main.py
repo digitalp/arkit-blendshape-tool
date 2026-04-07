@@ -31,6 +31,7 @@ from glb_utils import (
 from transfer import transfer_all_blendshapes
 from inject import inject_morph_targets
 from extras import synthesize_extras
+from skeleton_fix import add_missing_bones
 
 
 def cmd_inspect(args):
@@ -130,9 +131,15 @@ def cmd_transfer(args):
     print(f"Reference: {ref_positions.shape[0]} verts, "
           f"{len(ref_blendshapes)} blendshapes")
 
+    # Fix skeleton: add missing bones
+    target_gltf, added_bones = add_missing_bones(target_gltf)
+    if added_bones:
+        print(f"Added missing bones: {', '.join(added_bones)}")
+
     # Find ALL face-related meshes in target
     target_face_meshes = find_all_face_meshes(target_gltf)
     if not target_face_meshes:
+        # Single-mesh avatar (like Avaturn T1) — use primary face mesh
         target_face = find_face_mesh(target_gltf, args.face_mesh_target)
         if target_face is None:
             print("ERROR: Could not find face mesh in target GLB.")
