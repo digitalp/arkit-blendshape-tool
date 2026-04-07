@@ -3,13 +3,41 @@ Blendshape transfer using nearest-vertex correspondence.
 
 Given a reference mesh (with blendshapes) and a target mesh (without),
 this module transfers the morph target displacements by:
-1. Building a KD-tree of the reference mesh vertices
-2. For each target vertex, finding the nearest reference vertex
-3. Scaling the displacement based on local geometry differences
+1. Auto-aligning the reference head to the target head region
+2. Building a KD-tree of the aligned reference mesh vertices
+3. For each target vertex, finding the nearest reference vertex
+4. Transferring displacement directly (no destructive falloff)
 """
 
 import numpy as np
 from scipy.spatial import cKDTree
+
+
+def _estimate_head_center(positions: np.ndarray) -> np.ndarray:
+    """Estimate the center of the head region in a mesh."""
+    # For a head-only mesh, just use the centroid
+    if positions.shape[0] < 5000:
+        return positions.mean(axis=0)
+
+    # For a full-body mesh, the head is typically the highest region
+    y_vals = positions[:, 1]
+    y_threshold = np.percentile(y_vals, 75)
+    head_mask = y_vals > y_threshold
+    return positions[head_mask].mean(axis=0)
+
+
+def _align_ref_to_target(
+    ref_positions: np.ndarray,
+    target_positions: np.ndarray,
+) -> np.ndarray:
+    """
+    Translate the reference positions so its center aligns with the
+    target's head region center. Returns the aligned ref positions.
+    """
+    ref_center = _estimate_head_center(ref_positions)
+    tgt_center = _estimate_head_center(target_positions)
+    offset = tgt_center - ref_center
+    return ref_positions + offset
 
 
 def build_correspondence(
@@ -18,19 +46,8 @@ def build_correspondence(
     max_distance: float = 0.1,
 ) -> tuple:
     """
-    Build vertex correspondence between reference and target meshes
-    using nearest-neighbor lookup.
-
-    Args:
-        ref_positions: (N, 3) reference mesh vertices
-        target_positions: (M, 3) target mesh vertices
-        max_distance: max distance threshold for valid correspondence
-
-    Returns:
-        (indices, distances, mask):
-            indices: (M,) index into ref_positions for each target vertex
-            distances: (M,) distance to nearest ref vertex
-            mask: (M,) bool, True if correspondence is valid
+    Build vertex correspondence using nearest-neighbor lookup.
+    Returns (indices, distances, mask).
     """
     tree = cKDTree(ref_positions)
     distances, indices = tree.query(target_positions, k=1)
@@ -47,62 +64,35 @@ def compute_local_scale(
     """
     Compute per-vertex scale factor based on local neighborhood size
     differences between reference and target meshes.
-
-    This helps adapt displacements when meshes have different scales
-    or proportions in different regions.
-
-    Returns:
-        (M,) array of scale factors for each target vertex
     """
     ref_tree = cKDTree(ref_positions)
     target_tree = cKDTree(target_positions)
 
-    # For each target vertex, measure local neighborhood radius
     target_dists, _ = target_tree.query(target_positions, k=neighborhood_k + 1)
-    target_radius = np.mean(target_dists[:, 1:], axis=1)  # skip self
+    target_radius = np.mean(target_dists[:, 1:], axis=1)
 
-    # For corresponding ref vertices, measure local neighborhood radius
     ref_subset = ref_positions[indices]
     ref_dists, _ = ref_tree.query(ref_subset, k=neighborhood_k + 1)
     ref_radius = np.mean(ref_dists[:, 1:], axis=1)
 
-    # Scale factor: target_local_size / ref_local_size
     scale = np.where(ref_radius > 1e-8, target_radius / ref_radius, 1.0)
-
-    # Clamp to reasonable range
     scale = np.clip(scale, 0.5, 2.0)
-
     return scale
 
 
 def transfer_blendshape(
-    ref_positions: np.ndarray,
-    target_positions: np.ndarray,
     ref_displacement: np.ndarray,
     indices: np.ndarray,
     mask: np.ndarray,
     local_scale: np.ndarray,
-    falloff_distance: float = 0.05,
-    distances: np.ndarray = None,
+    vertex_count: int,
 ) -> np.ndarray:
     """
     Transfer a single blendshape displacement from reference to target.
-
-    Args:
-        ref_positions: (N, 3) reference neutral vertices
-        target_positions: (M, 3) target neutral vertices
-        ref_displacement: (N, 3) displacement for this blendshape on ref
-        indices: (M,) nearest ref vertex index per target vertex
-        mask: (M,) valid correspondence mask
-        local_scale: (M,) per-vertex scale factors
-        falloff_distance: distance over which displacement fades out
-        distances: (M,) distance to nearest ref vertex
-
-    Returns:
-        (M, 3) displacement array for the target mesh
+    No distance falloff — if a vertex has a valid correspondence, it gets
+    the full displacement (scaled by local geometry).
     """
-    M = target_positions.shape[0]
-    target_disp = np.zeros((M, 3), dtype=np.float32)
+    target_disp = np.zeros((vertex_count, 3), dtype=np.float32)
 
     # Look up the reference displacement for each target vertex
     mapped_disp = ref_displacement[indices]
@@ -110,13 +100,7 @@ def transfer_blendshape(
     # Apply local scale
     scaled_disp = mapped_disp * local_scale[:, np.newaxis]
 
-    # Apply distance-based falloff for vertices far from correspondence
-    if distances is not None:
-        weight = np.clip(1.0 - distances / falloff_distance, 0.0, 1.0)
-        weight = weight ** 2  # smooth falloff
-        scaled_disp *= weight[:, np.newaxis]
-
-    # Apply mask
+    # Apply only to vertices with valid correspondence — full strength
     target_disp[mask] = scaled_disp[mask]
 
     return target_disp
@@ -131,46 +115,37 @@ def transfer_all_blendshapes(
 ) -> dict:
     """
     Transfer all blendshapes from reference to target mesh.
-
-    Args:
-        ref_positions: (N, 3) reference neutral vertices
-        target_positions: (M, 3) target neutral vertices
-        ref_blendshapes: dict of {name: (N, 3) displacement}
-        max_distance: max correspondence distance
-        falloff_distance: falloff distance for weight blending
-
-    Returns:
-        dict of {name: (M, 3) displacement} for target mesh
+    Auto-aligns the reference to the target before computing correspondence.
     """
+    # Auto-align reference head to target head region
+    aligned_ref = _align_ref_to_target(ref_positions, target_positions)
+
     print(f"  Building correspondence: {ref_positions.shape[0]} ref -> "
           f"{target_positions.shape[0]} target vertices")
 
     indices, distances, mask = build_correspondence(
-        ref_positions, target_positions, max_distance
+        aligned_ref, target_positions, max_distance
     )
 
     valid_pct = np.sum(mask) / len(mask) * 100
     print(f"  Valid correspondences: {np.sum(mask)}/{len(mask)} ({valid_pct:.1f}%)")
 
-    if valid_pct < 30:
-        print("  WARNING: Low correspondence rate. Meshes may be misaligned or "
-              "have very different topology. Try increasing --max-distance.")
+    if valid_pct < 10:
+        print("  WARNING: Very low correspondence. Trying with larger distance...")
+        indices, distances, mask = build_correspondence(
+            aligned_ref, target_positions, max_distance * 2
+        )
+        valid_pct = np.sum(mask) / len(mask) * 100
+        print(f"  Retry correspondences: {np.sum(mask)}/{len(mask)} ({valid_pct:.1f}%)")
 
     local_scale = compute_local_scale(
-        ref_positions, target_positions, indices
+        aligned_ref, target_positions, indices
     )
 
     result = {}
     for name, ref_disp in ref_blendshapes.items():
         target_disp = transfer_blendshape(
-            ref_positions,
-            target_positions,
-            ref_disp,
-            indices,
-            mask,
-            local_scale,
-            falloff_distance,
-            distances,
+            ref_disp, indices, mask, local_scale, target_positions.shape[0]
         )
         result[name] = target_disp
 
