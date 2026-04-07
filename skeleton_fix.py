@@ -6,31 +6,22 @@ requires but Avaturn T1 avatars don't have.
 """
 
 import numpy as np
-from pygltflib import GLTF2, Node
+from pygltflib import GLTF2, Node, BufferView
 
-
-# Approximate eye positions relative to the Head bone (in local space).
-# These are reasonable defaults for a humanoid avatar.
-# TalkingHead uses them for eye-contact direction and avatar height estimation.
-LEFT_EYE_OFFSET = [0.03, 0.07, 0.08]    # slightly left, up, forward
-RIGHT_EYE_OFFSET = [-0.03, 0.07, 0.08]  # slightly right, up, forward
-HEAD_TOP_OFFSET = [0.0, 0.15, 0.0]      # straight up from head
+LEFT_EYE_OFFSET = [0.03, 0.07, 0.08]
+RIGHT_EYE_OFFSET = [-0.03, 0.07, 0.08]
+HEAD_TOP_OFFSET = [0.0, 0.15, 0.0]
 
 
 def add_missing_bones(gltf: GLTF2) -> tuple:
     """
     Add LeftEye, RightEye, and HeadTop_End bones if missing.
-    These are required by TalkingHead for eye tracking and height estimation.
-
-    Also adds them to the skin's joint list so they're part of the skeleton.
-
-    Returns:
-        (gltf, added_bones) where added_bones is a list of bone names added
+    Returns (gltf, added_bones).
     """
     node_names = {node.name: i for i, node in enumerate(gltf.nodes) if node.name}
     added = []
+    bones_to_add = []
 
-    # Find the Head bone
     head_idx = node_names.get("Head")
     if head_idx is None:
         print("  WARNING: No 'Head' bone found — cannot add eye bones")
@@ -40,96 +31,77 @@ def add_missing_bones(gltf: GLTF2) -> tuple:
     if head_node.children is None:
         head_node.children = []
 
-    # Add LeftEye if missing
-    if "LeftEye" not in node_names:
-        eye_node = Node(
-            name="LeftEye",
-            translation=LEFT_EYE_OFFSET,
-            children=[],
-        )
-        eye_idx = len(gltf.nodes)
-        gltf.nodes.append(eye_node)
-        head_node.children.append(eye_idx)
-        node_names["LeftEye"] = eye_idx
-        added.append("LeftEye")
+    for name, offset in [
+        ("LeftEye", LEFT_EYE_OFFSET),
+        ("RightEye", RIGHT_EYE_OFFSET),
+        ("HeadTop_End", HEAD_TOP_OFFSET),
+    ]:
+        if name not in node_names:
+            node = Node(name=name, translation=offset, children=[])
+            node_idx = len(gltf.nodes)
+            gltf.nodes.append(node)
+            head_node.children.append(node_idx)
+            node_names[name] = node_idx
+            added.append(name)
+            bones_to_add.append(node_idx)
 
-        # Add to skin joints
-        _add_to_skin_joints(gltf, eye_idx)
-
-    # Add RightEye if missing
-    if "RightEye" not in node_names:
-        eye_node = Node(
-            name="RightEye",
-            translation=RIGHT_EYE_OFFSET,
-            children=[],
-        )
-        eye_idx = len(gltf.nodes)
-        gltf.nodes.append(eye_node)
-        head_node.children.append(eye_idx)
-        node_names["RightEye"] = eye_idx
-        added.append("RightEye")
-
-        _add_to_skin_joints(gltf, eye_idx)
-
-    # Add HeadTop_End if missing
-    if "HeadTop_End" not in node_names:
-        top_node = Node(
-            name="HeadTop_End",
-            translation=HEAD_TOP_OFFSET,
-            children=[],
-        )
-        top_idx = len(gltf.nodes)
-        gltf.nodes.append(top_node)
-        head_node.children.append(top_idx)
-        node_names["HeadTop_End"] = top_idx
-        added.append("HeadTop_End")
-
-        _add_to_skin_joints(gltf, top_idx)
+    # Add all new bones to skins in one pass (avoids repeated blob rebuilds)
+    if bones_to_add:
+        for skin in gltf.skins:
+            _add_joints_to_skin(gltf, skin, bones_to_add)
 
     return gltf, added
 
 
-def _add_to_skin_joints(gltf: GLTF2, node_idx: int):
-    """Add a node index to all skins' joint lists."""
-    for skin in gltf.skins:
-        if node_idx not in skin.joints:
-            skin.joints.append(node_idx)
-
-            # We also need to extend the inverse bind matrices accessor
-            # with an identity matrix for the new joint
-            if skin.inverseBindMatrices is not None:
-                _extend_ibm(gltf, skin.inverseBindMatrices)
-
-
-def _extend_ibm(gltf: GLTF2, ibm_accessor_idx: int):
+def _add_joints_to_skin(gltf: GLTF2, skin, new_joint_indices: list):
     """
-    Extend the inverse bind matrices accessor by one identity matrix.
-    This is needed when adding a new joint to the skin.
+    Add new joints to a skin and extend its inverse bind matrices.
+    Appends new data at the END of the blob — never inserts in the middle.
     """
-    accessor = gltf.accessors[ibm_accessor_idx]
-    bv = gltf.bufferViews[accessor.bufferView]
+    # Add joint indices
+    for idx in new_joint_indices:
+        if idx not in skin.joints:
+            skin.joints.append(idx)
 
-    # Identity matrix as 16 floats (column-major, as glTF uses)
-    identity = np.eye(4, dtype=np.float32).T.tobytes()  # column-major
+    if skin.inverseBindMatrices is None:
+        return
 
-    blob = bytearray(gltf.binary_blob())
+    accessor = gltf.accessors[skin.inverseBindMatrices]
+    old_bv = gltf.bufferViews[accessor.bufferView]
 
-    # Insert the identity matrix at the end of this buffer view's data
-    insert_pos = (bv.byteOffset or 0) + bv.byteLength
-    blob[insert_pos:insert_pos] = identity
+    # Read existing IBM data
+    blob = gltf.binary_blob()
+    ibm_start = (old_bv.byteOffset or 0) + (accessor.byteOffset or 0)
+    ibm_length = accessor.count * 64  # MAT4 = 16 floats = 64 bytes
+    existing_ibm_data = blob[ibm_start : ibm_start + ibm_length]
 
-    # Update buffer view length
-    bv.byteLength += len(identity)
+    # Build new IBM data: existing + N identity matrices appended
+    identity = np.eye(4, dtype=np.float32).tobytes()  # glTF uses column-major but np eye is symmetric
+    new_ibm_data = existing_ibm_data + (identity * len(new_joint_indices))
 
-    # Update accessor count
-    accessor.count += 1
+    # Append the complete new IBM block at the end of the blob
+    blob_bytes = bytearray(blob)
 
-    # Shift all buffer views that come after this insertion point
-    for other_bv in gltf.bufferViews:
-        if other_bv is not bv:
-            if (other_bv.byteOffset or 0) >= insert_pos:
-                other_bv.byteOffset = (other_bv.byteOffset or 0) + len(identity)
+    # Align to 4 bytes
+    while len(blob_bytes) % 4 != 0:
+        blob_bytes.append(0)
 
-    # Update buffer total size
-    gltf.buffers[0].byteLength = len(blob)
-    gltf.set_binary_blob(bytes(blob))
+    new_bv_offset = len(blob_bytes)
+    blob_bytes.extend(new_ibm_data)
+
+    # Create a new buffer view for the IBM data
+    new_bv_index = len(gltf.bufferViews)
+    gltf.bufferViews.append(BufferView(
+        buffer=0,
+        byteOffset=new_bv_offset,
+        byteLength=len(new_ibm_data),
+    ))
+
+    # Update the accessor to point to the new buffer view
+    accessor.bufferView = new_bv_index
+    accessor.byteOffset = 0
+    accessor.count += len(new_joint_indices)
+
+    # Update buffer size and blob
+    gltf.buffers[0].byteLength = len(blob_bytes)
+    gltf.set_binary_blob(bytes(blob_bytes))
